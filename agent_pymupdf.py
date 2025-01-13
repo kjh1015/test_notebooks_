@@ -12,6 +12,8 @@ from langchain_community.vectorstores import Chroma
 import glob
 from tkinter import filedialog
 import tkinter as tk
+from langchain_openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # https://github.com/langchain-ai/langgraph/blob/main/examples/rag/langgraph_agentic_rag.ipynb
 # Load environment variables
@@ -99,6 +101,44 @@ def select_directory():
             root.destroy()
         except:
             pass
+
+def setup_retriever():
+    # Get all markdown files from data directory
+    markdown_files = glob.glob("data/*.md")
+    
+    if not markdown_files:
+        return None, "No markdown files found in data directory"
+    
+    # Load all markdown files
+    documents = []
+    for md_file in markdown_files:
+        try:
+            with open(md_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                documents.append(
+                    Document(
+                        page_content=content,
+                        metadata={"source": md_file}
+                    )
+                )
+        except Exception as e:
+            st.error(f"Error loading {md_file}: {str(e)}")
+    
+    # Split documents
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+    doc_splits = text_splitter.split_documents(documents)
+    
+    # Create vector store
+    vectorstore = Chroma.from_documents(
+        documents=doc_splits,
+        collection_name="pdf-markdown-store",
+        embedding=OpenAIEmbeddings(),
+    )
+    
+    return vectorstore.as_retriever(), f"Created retriever from {len(markdown_files)} files"
 
 # Streamlit UI
 st.title("PDF Content Extractor")
@@ -214,5 +254,27 @@ else:  # Process Directory mode
                         st.error(f"Error processing {pdf_path}: {str(e)}")
     elif st.session_state.show_file_select:
         st.warning("No PDF files found in the specified directory.")
+            
+    # Add this to your UI section where you want to set up the retriever
+    if st.button("Setup Retriever from Processed Files"):
+        with st.spinner("Setting up retriever..."):
+            retriever, message = setup_retriever()
+            if retriever:
+                st.session_state.retriever = retriever
+                st.success(message)
+            else:
+                st.warning(message)
+
+    # Example of using the retriever (add where needed)
+    if 'retriever' in st.session_state and st.session_state.retriever:
+        query = st.text_input("Ask a question about the documents:")
+        if query:
+            with st.spinner("Searching..."):
+                docs = st.session_state.retriever.get_relevant_documents(query)
+                st.write("### Relevant Passages")
+                for doc in docs:
+                    st.write("---")
+                    st.write(doc.page_content)
+                    st.write(f"Source: {doc.metadata['source']}")
             
             
