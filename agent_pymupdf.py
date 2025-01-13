@@ -14,6 +14,16 @@ from tkinter import filedialog
 import tkinter as tk
 from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.tools.retriever import create_retriever_tool
+import chromadb
+from typing import Annotated, Sequence, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict):
+    """State definition for the agent."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
 
 # https://github.com/langchain-ai/langgraph/blob/main/examples/rag/langgraph_agentic_rag.ipynb
 # Load environment variables
@@ -124,21 +134,56 @@ def setup_retriever():
         except Exception as e:
             st.error(f"Error loading {md_file}: {str(e)}")
     
-    # Split documents
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=1000,
-        chunk_overlap=100
+    # Adjust text splitter parameters for more meaningful chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,          # Smaller chunks for more precise retrieval
+        chunk_overlap=50,        # Smaller overlap to reduce redundancy
+        length_function=len,
+        separators=[
+            "\n## ",            # Split on header level 2
+            "\n### ",           # Split on header level 3
+            "\n\n",             # Split on paragraphs
+            "\n",               # Split on lines
+            ". ",               # Split on sentences
+            " ",                # Split on words as last resort
+            ""
+        ]
     )
     doc_splits = text_splitter.split_documents(documents)
+    
+    # Create persistent client
+    client = chromadb.PersistentClient(path="./chroma_db")
+    
+    # Delete existing collection if it exists to refresh the chunks
+    try:
+        client.delete_collection("pdf-markdown-store")
+    except:
+        pass
     
     # Create vector store
     vectorstore = Chroma.from_documents(
         documents=doc_splits,
         collection_name="pdf-markdown-store",
         embedding=OpenAIEmbeddings(),
+        client=client
     )
     
-    return vectorstore.as_retriever(), f"Created retriever from {len(markdown_files)} files"
+    # Create retriever with adjusted k for smaller chunks
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": 6              # Increased k to get more small chunks
+        }
+    )
+    
+    # Create retriever tool
+    retriever_tool = create_retriever_tool(
+        retriever,
+        "search_pdf_documents",
+        "Search and retrieve information from the processed PDF documents that have been converted to markdown.",
+    )
+    
+    return retriever_tool, f"Created retriever tool from {len(markdown_files)} files with {len(doc_splits)} chunks"
 
 # Streamlit UI
 st.title("PDF Content Extractor")
@@ -256,25 +301,56 @@ else:  # Process Directory mode
         st.warning("No PDF files found in the specified directory.")
             
     # Add this to your UI section where you want to set up the retriever
-    if st.button("Setup Retriever from Processed Files"):
-        with st.spinner("Setting up retriever..."):
-            retriever, message = setup_retriever()
-            if retriever:
-                st.session_state.retriever = retriever
+    if st.button("Setup Retriever Tool"):
+        with st.spinner("Setting up retriever tool..."):
+            retriever_tool, message = setup_retriever()
+            if retriever_tool:
+                st.session_state.retriever_tool = retriever_tool
+                st.session_state.tools = [retriever_tool]
                 st.success(message)
             else:
                 st.warning(message)
 
-    # Example of using the retriever (add where needed)
-    if 'retriever' in st.session_state and st.session_state.retriever:
+    # Example of using the retriever tool
+    if 'retriever_tool' in st.session_state:
+        # Initialize agent state if not already done
+        if 'agent_state' not in st.session_state:
+            st.session_state.agent_state = AgentState(messages=[])
+        
         query = st.text_input("Ask a question about the documents:")
         if query:
             with st.spinner("Searching..."):
-                docs = st.session_state.retriever.get_relevant_documents(query)
-                st.write("### Relevant Passages")
-                for doc in docs:
-                    st.write("---")
-                    st.write(doc.page_content)
-                    st.write(f"Source: {doc.metadata['source']}")
-            
-            
+                try:
+                    tool_result = st.session_state.retriever_tool.invoke(query)
+                    st.write("### Search Results")
+                    if isinstance(tool_result, list):
+                        for doc in tool_result:
+                            st.write("---")
+                            if hasattr(doc, 'page_content'):
+                                st.write(doc.page_content)
+                                st.write(f"Source: {doc.metadata['source']}")
+                                
+                                # Add the result to agent state messages
+                                st.session_state.agent_state["messages"].append(
+                                    BaseMessage(
+                                        content=f"Retrieved content: {doc.page_content}\nSource: {doc.metadata['source']}",
+                                        type="system"
+                                    )
+                                )
+                            else:
+                                st.write(doc)
+                    else:
+                        st.write(tool_result)
+                    
+                    # Display current state of messages
+                    st.write("### Agent State Messages")
+                    for msg in st.session_state.agent_state["messages"]:
+                        st.write(f"Type: {msg.type}")
+                        st.write(f"Content: {msg.content}")
+                        st.write("---")
+                        
+                except Exception as e:
+                    st.error(f"Error processing query: {str(e)}")  
+                    
+              
+                    
