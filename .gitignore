@@ -1,2 +1,6 @@
 .venv/
 .env
+.ipynb_checkpoints/
+data/
+vector_store/
+logdir/
