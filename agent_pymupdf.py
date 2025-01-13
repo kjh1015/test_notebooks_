@@ -16,9 +16,14 @@ from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.tools.retriever import create_retriever_tool
 import chromadb
-from typing import Annotated, Sequence, TypedDict
-from langchain_core.messages import BaseMessage
+from typing import Annotated, Sequence, TypedDict, Literal
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph.message import add_messages
+from langchain import hub
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langgraph.prebuilt import tools_condition
+from langchain_core.output_parsers import StrOutputParser
+import logging
 
 
 class AgentState(TypedDict):
@@ -32,6 +37,10 @@ load_dotenv()
 # Set up OpenAI API key
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 if 'directory_selected' not in st.session_state:
     st.session_state.directory_selected = False
@@ -185,6 +194,181 @@ def setup_retriever():
     
     return retriever_tool, f"Created retriever tool from {len(markdown_files)} files with {len(doc_splits)} chunks"
 
+def setup_tools(retriever_tool):
+    """Setup tools for the agent"""
+    tools = [retriever_tool]
+    return tools
+
+def agent(state):
+    """
+    Agent function that decides whether to use tools or not.
+    """
+    print("---AGENT DECISION---")
+    messages = state["messages"]
+    
+    # Create a system message to guide the agent
+    system_message = """You are a helpful assistant that decides whether to search through documents or not.
+    When a user asks a question, you should use the search_pdf_documents tool to find relevant information.
+    Always use the tool for the first query to search through the documents."""
+    
+    # Add system message if it's not already there
+    if not any(msg.content == system_message for msg in messages):
+        messages.insert(0, SystemMessage(content=system_message))
+    
+    model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo")
+    model = model.bind_tools(st.session_state.tools)
+    response = model.invoke(messages)
+    
+    print(f"Agent response: {response.content}")
+    return {"messages": [response]}
+
+def grade_documents(state):
+    """
+    Determines whether the retrieved documents are relevant.
+    """
+    print("---GRADE DOCUMENTS---")
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    class grade(BaseModel):
+        """Binary score for relevance check."""
+        binary_score: str = Field(description="Relevance score 'yes' or 'no'")
+
+    model = ChatOpenAI(temperature=0, model="gpt-4-0125-preview", streaming=True)
+    llm_with_tool = model.with_structured_output(grade)
+    
+    prompt = PromptTemplate(
+        template="""You are a grader assessing relevance of a retrieved document to a user question. \n 
+        Here is the retrieved document: \n\n {context} \n\n
+        Here is the user question: {question} \n
+        If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n
+        Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.""",
+        input_variables=["context", "question"],
+    )
+    
+    chain = prompt | llm_with_tool
+    question = messages[0].content
+    docs = last_message.content
+    
+    scored_result = chain.invoke({"question": question, "context": docs})
+    score = scored_result.binary_score
+    
+    print(f"Relevance score: {score}")
+    return "generate" if score == "yes" else "rewrite"
+
+def should_generate(state):
+    """Determine if we should generate an answer"""
+    messages = state["messages"]
+    for message in messages:
+        if "RELEVANCE_SCORE: yes" in message.content:
+            return True
+    return False
+
+def rewrite(state):
+    """
+    Transform the query to produce a better question.
+    """
+    print("---TRANSFORM QUERY---")
+    messages = state["messages"]
+    question = messages[0].content
+
+    msg = [
+        HumanMessage(
+            content=f""" \n 
+    Look at the input and try to reason about the underlying semantic intent / meaning. \n 
+    Here is the initial question:
+    \n ------- \n
+    {question} 
+    \n ------- \n
+    Formulate an improved question: """,
+        )
+    ]
+
+    model = ChatOpenAI(temperature=0, model="gpt-4-0125-preview", streaming=True)
+    response = model.invoke(msg)
+    # Return as a dictionary with messages key
+    return {"messages": [response]}
+
+def generate(state):
+    """
+    Generate answer
+    """
+    print("---GENERATE---")
+    messages = state["messages"]
+    question = messages[0].content
+    last_message = messages[-1]
+    docs = last_message.content
+
+    prompt = hub.pull("rlm/rag-prompt")
+    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0, streaming=True)
+
+    rag_chain = prompt | llm | StrOutputParser()
+    response = rag_chain.invoke({"context": docs, "question": question})
+    # Convert string response to HumanMessage
+    return {"messages": [HumanMessage(content=response)]}
+
+def setup_graph():
+    """Setup the processing graph with nodes and edges"""
+    from langgraph.graph import END, StateGraph, START
+    from langgraph.prebuilt import ToolNode, tools_condition
+    
+    # Create workflow
+    workflow = StateGraph(AgentState)
+    
+    # Define the tool node for retrieval
+    retrieve = ToolNode([st.session_state.retriever_tool])
+    
+    # Add all nodes
+    workflow.add_node("agent", agent)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("rewrite", rewrite)
+    workflow.add_node("generate", generate)
+    
+    # Start with agent
+    workflow.add_edge(START, "agent")
+    
+    # Add conditional edges from agent to either retrieve or end
+    workflow.add_conditional_edges(
+        "agent",
+        tools_condition,
+        {
+            "tools": "retrieve",
+            END: END,
+        }
+    )
+    
+    # Add conditional edges from retrieve based on document relevance
+    workflow.add_conditional_edges(
+        "retrieve",
+        grade_documents,
+        {
+            "generate": "generate",
+            "rewrite": "rewrite"
+        }
+    )
+    
+    # Add final edges
+    workflow.add_edge("generate", END)
+    workflow.add_edge("rewrite", "agent")
+    
+    # Compile
+    graph = workflow.compile()
+    
+    return graph
+
+# Add a function to process retrieval results
+def process_retrieval(docs):
+    """Process retrieved documents into a readable format"""
+    if isinstance(docs, list):
+        processed_docs = []
+        for doc in docs:
+            if hasattr(doc, 'page_content'):
+                processed_docs.append(f"Content: {doc.page_content}\nSource: {doc.metadata.get('source', 'unknown')}")
+            else:
+                processed_docs.append(str(doc))
+        return "\n\n---\n\n".join(processed_docs)
+    return str(docs)
+
 # Streamlit UI
 st.title("PDF Content Extractor")
 
@@ -306,51 +490,63 @@ else:  # Process Directory mode
             retriever_tool, message = setup_retriever()
             if retriever_tool:
                 st.session_state.retriever_tool = retriever_tool
-                st.session_state.tools = [retriever_tool]
+                st.session_state.tools = setup_tools(retriever_tool)
                 st.success(message)
             else:
                 st.warning(message)
 
     # Example of using the retriever tool
     if 'retriever_tool' in st.session_state:
-        # Initialize agent state if not already done
         if 'agent_state' not in st.session_state:
+            st.session_state.tools = setup_tools(st.session_state.retriever_tool)
             st.session_state.agent_state = AgentState(messages=[])
+            st.session_state.graph = setup_graph()
         
         query = st.text_input("Ask a question about the documents:")
         if query:
-            with st.spinner("Searching..."):
+            with st.spinner("Processing query..."):
                 try:
-                    tool_result = st.session_state.retriever_tool.invoke(query)
-                    st.write("### Search Results")
-                    if isinstance(tool_result, list):
-                        for doc in tool_result:
-                            st.write("---")
-                            if hasattr(doc, 'page_content'):
-                                st.write(doc.page_content)
-                                st.write(f"Source: {doc.metadata['source']}")
-                                
-                                # Add the result to agent state messages
-                                st.session_state.agent_state["messages"].append(
-                                    BaseMessage(
-                                        content=f"Retrieved content: {doc.page_content}\nSource: {doc.metadata['source']}",
-                                        type="system"
-                                    )
-                                )
-                            else:
-                                st.write(doc)
-                    else:
-                        st.write(tool_result)
+                    # Create a container for logs
+                    log_container = st.container()
                     
-                    # Display current state of messages
-                    st.write("### Agent State Messages")
-                    for msg in st.session_state.agent_state["messages"]:
-                        st.write(f"Type: {msg.type}")
-                        st.write(f"Content: {msg.content}")
-                        st.write("---")
+                    # Initialize state with the question
+                    initial_state = AgentState(
+                        messages=[HumanMessage(content=query)]
+                    )
+                    
+                    # Run the graph and display all steps
+                    st.write("### Processing Steps")
+                    for output in st.session_state.graph.stream(initial_state):
+                        # Log the output for debugging
+                        logger.info(f"Graph output: {output}")
                         
-                except Exception as e:
-                    st.error(f"Error processing query: {str(e)}")  
+                        if isinstance(output, dict):
+                            if "messages" in output:
+                                for message in output["messages"]:
+                                    # Display all messages
+                                    with log_container:
+                                        st.write("---")
+                                        if hasattr(message, 'type'):
+                                            st.write(f"Message Type: {message.type}")
+                                        if hasattr(message, 'content'):
+                                            st.write(f"Content: {message.content}")
+                                        
+                                    # Log for debugging
+                                    logger.info(f"Message: {message.content if hasattr(message, 'content') else message}")
+                            
+                            # Display any additional state information
+                            if "next" in output:
+                                with log_container:
+                                    st.write(f"Next step: {output['next']}")
                     
-              
+                    # Display final state
+                    st.write("### Final State")
+                    if hasattr(st.session_state.agent_state, "messages"):
+                        for msg in st.session_state.agent_state.messages:
+                            st.write("---")
+                            st.write(msg.content)
+                    
+                except Exception as e:
+                    st.error(f"Error processing query: {str(e)}")
+                    logger.error(f"Full error: {str(e)}", exc_info=True)
                     
