@@ -70,7 +70,7 @@ def process_pdf(pdf_path):
 
 def chunk_markdown(md_text):
     # Initialize the Markdown text splitter
-    text_splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=200)
+    text_splitter = MarkdownTextSplitter(chunk_size=100, chunk_overlap=20)
     
     # Split the text into chunks
     chunks = text_splitter.split_text(md_text)
