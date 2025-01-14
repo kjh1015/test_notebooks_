@@ -17,7 +17,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.tools.retriever import create_retriever_tool
 import chromadb
 from typing import Annotated, Sequence, TypedDict, Literal
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import add_messages
 from langchain import hub
 from langchain_core.pydantic_v1 import BaseModel, Field
@@ -70,7 +70,7 @@ def process_pdf(pdf_path):
 
 def chunk_markdown(md_text):
     # Initialize the Markdown text splitter
-    text_splitter = MarkdownTextSplitter(chunk_size=2000, chunk_overlap=200)
+    text_splitter = MarkdownTextSplitter(chunk_size=1000, chunk_overlap=200)
     
     # Split the text into chunks
     chunks = text_splitter.split_text(md_text)
@@ -206,13 +206,14 @@ def agent(state):
     print("---AGENT DECISION---")
     messages = state["messages"]
     
-    # Create a system message to guide the agent
-    system_message = """You are a helpful assistant that decides whether to search through documents or not.
-    When a user asks a question, you should use the search_pdf_documents tool to find relevant information.
-    Always use the tool for the first query to search through the documents."""
+    # Create a system message that explicitly instructs the agent to use the tool
+    system_message = """You are a helpful assistant with access to a document search tool.
+    ALWAYS use the search_pdf_documents tool first to find relevant information.
+    DO NOT explain how to use the tool - just use it directly.
+    After getting search results, provide a concise answer based on the retrieved information."""
     
     # Add system message if it's not already there
-    if not any(msg.content == system_message for msg in messages):
+    if not any(msg.type == "system" for msg in messages):
         messages.insert(0, SystemMessage(content=system_message))
     
     model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo")
@@ -284,7 +285,7 @@ def rewrite(state):
         )
     ]
 
-    model = ChatOpenAI(temperature=0, model="gpt-4-0125-preview", streaming=True)
+    model = ChatOpenAI(temperature=0, model="gpt-4o-mini", streaming=True)
     response = model.invoke(msg)
     # Return as a dictionary with messages key
     return {"messages": [response]}
@@ -300,7 +301,7 @@ def generate(state):
     docs = last_message.content
 
     prompt = hub.pull("rlm/rag-prompt")
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0, streaming=True)
+    llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0, streaming=True)
 
     rag_chain = prompt | llm | StrOutputParser()
     response = rag_chain.invoke({"context": docs, "question": question})
@@ -495,58 +496,101 @@ else:  # Process Directory mode
             else:
                 st.warning(message)
 
-    # Example of using the retriever tool
+    # Update the UI section
     if 'retriever_tool' in st.session_state:
         if 'agent_state' not in st.session_state:
             st.session_state.tools = setup_tools(st.session_state.retriever_tool)
             st.session_state.agent_state = AgentState(messages=[])
             st.session_state.graph = setup_graph()
+            st.session_state.awaiting_clarification = False
+            st.session_state.original_query = ""
         
-        query = st.text_input("Ask a question about the documents:")
-        if query:
-            with st.spinner("Processing query..."):
-                try:
-                    # Create a container for logs
-                    log_container = st.container()
-                    
-                    # Initialize state with the question
-                    initial_state = AgentState(
-                        messages=[HumanMessage(content=query)]
-                    )
-                    
-                    # Run the graph and display all steps
-                    st.write("### Processing Steps")
-                    for output in st.session_state.graph.stream(initial_state):
-                        # Log the output for debugging
-                        logger.info(f"Graph output: {output}")
-                        
-                        if isinstance(output, dict):
-                            if "messages" in output:
-                                for message in output["messages"]:
-                                    # Display all messages
-                                    with log_container:
-                                        st.write("---")
-                                        if hasattr(message, 'type'):
-                                            st.write(f"Message Type: {message.type}")
-                                        if hasattr(message, 'content'):
-                                            st.write(f"Content: {message.content}")
-                                        
-                                    # Log for debugging
-                                    logger.info(f"Message: {message.content if hasattr(message, 'content') else message}")
+        # Main query input
+        if not st.session_state.awaiting_clarification:
+            query = st.text_input("Ask a question about the documents:")
+            if query:
+                # Check if query is too vague
+                if len(query.strip()) < 3 or query.strip().lower() in ["a", "aa", "aaa", "test"]:
+                    st.session_state.awaiting_clarification = True
+                    st.session_state.original_query = query
+                    st.rerun()
+                else:
+                    with st.spinner("Processing query..."):
+                        try:
+                            initial_state = AgentState(
+                                messages=[HumanMessage(content=query)]
+                            )
                             
-                            # Display any additional state information
-                            if "next" in output:
-                                with log_container:
-                                    st.write(f"Next step: {output['next']}")
+                            process_container = st.container()
+                            
+                            for output in st.session_state.graph.stream(initial_state):
+                                print(f"Raw output: {output}")
+                                
+                                with process_container:
+                                    # Handle retrieve output
+                                    if isinstance(output, dict) and 'retrieve' in output:
+                                        retrieve_data = output['retrieve']
+                                        if isinstance(retrieve_data, dict) and 'messages' in retrieve_data:
+                                            for msg in retrieve_data['messages']:
+                                                if hasattr(msg, 'content'):
+                                                    st.write("📚 Retrieved Content:")
+                                                    content = msg.content
+                                                    if isinstance(content, str):
+                                                        # Try to parse content for source information
+                                                        if "Content:" in content and "Source:" in content:
+                                                            sections = content.split("Content:")
+                                                            for section in sections[1:]:
+                                                                if "Source:" in section:
+                                                                    doc_content, source = section.split("Source:", 1)
+                                                                    source = source.strip()
+                                                                    filename = source.split('/')[-1] if '/' in source else source
+                                                                    
+                                                                    with st.expander(f"📄 {filename}"):
+                                                                        st.markdown(doc_content.strip())
+                                                                        st.caption(f"Source: {source}")
+                                                        else:
+                                                            # Display as regular content
+                                                            with st.expander("📄 Retrieved Document"):
+                                                                st.markdown(content)
+                                    
+                                    # Handle rewrite output
+                                    if isinstance(output, dict) and 'rewrite' in output:
+                                        rewrite_data = output['rewrite']
+                                        if isinstance(rewrite_data, dict) and 'messages' in rewrite_data:
+                                            st.write("🔄 Refining Query:")
+                                            for msg in rewrite_data['messages']:
+                                                if hasattr(msg, 'content'):
+                                                    st.info(msg.content)
+                                    
+                                    # Handle agent output
+                                    if isinstance(output, dict) and 'agent' in output:
+                                        agent_data = output['agent']
+                                        if isinstance(agent_data, dict) and 'messages' in agent_data:
+                                            st.write("🤖 Agent Response:")
+                                            for msg in agent_data['messages']:
+                                                if hasattr(msg, 'content'):
+                                                    st.success(msg.content)
+                                    
+                                    # Handle any other messages
+                                    if isinstance(output, dict) and 'messages' in output:
+                                        for msg in output['messages']:
+                                            if hasattr(msg, 'content'):
+                                                st.write("💬 Message:")
+                                                st.markdown(msg.content)
                     
-                    # Display final state
-                    st.write("### Final State")
-                    if hasattr(st.session_state.agent_state, "messages"):
-                        for msg in st.session_state.agent_state.messages:
-                            st.write("---")
-                            st.write(msg.content)
+                        except Exception as e:
+                            st.error(f"Error processing query: {str(e)}")
+                            print(f"Full error: {str(e)}")
+        
+        # Clarification input when needed
+        else:
+            st.warning(f"Your query '{st.session_state.original_query}' seems unclear. Could you please provide more details?")
+            clarification = st.text_input("Please provide a more specific question:", key="clarification_input")
+            
+            if clarification:
+                st.session_state.awaiting_clarification = False
+                st.session_state.original_query = ""
+                # Clear the text input by forcing a rerun
+                st.rerun()
                     
-                except Exception as e:
-                    st.error(f"Error processing query: {str(e)}")
-                    logger.error(f"Full error: {str(e)}", exc_info=True)
                     
