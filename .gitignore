@@ -5,3 +5,4 @@ data/
 vector_store/
 logdir/
 chroma_db/
+screenshots/
