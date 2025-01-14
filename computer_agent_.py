@@ -5,8 +5,14 @@ from langchain_core.tools import Tool
 import pyautogui
 import time
 import os
+from dotenv import load_dotenv
 import base64
+# Load environment variables
+load_dotenv()
 
+# Set up OpenAI API key
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY")
 
 # Configure PyAutoGUI safety settings
 pyautogui.FAILSAFE = True
