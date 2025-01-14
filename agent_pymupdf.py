@@ -31,6 +31,8 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 # https://github.com/langchain-ai/langgraph/blob/main/examples/rag/langgraph_agentic_rag.ipynb
+# https://langchain-ai.github.io/langgraph/tutorials/rag/langgraph_self_rag/
+# https://github.com/langchain-ai/langgraph/blob/main/docs/docs/tutorials/llm-compiler/LLMCompiler.ipynb
 # Load environment variables
 load_dotenv()
 
