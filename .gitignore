@@ -6,3 +6,5 @@ vector_store/
 logdir/
 chroma_db/
 screenshots/
+.DS_Store
+log/
