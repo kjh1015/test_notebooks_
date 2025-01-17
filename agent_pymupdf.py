@@ -303,7 +303,7 @@ def generate(state):
     docs = last_message.content
 
     prompt = hub.pull("rlm/rag-prompt")
-    llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0, streaming=True)
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0, streaming=True)
 
     rag_chain = prompt | llm | StrOutputParser()
     response = rag_chain.invoke({"context": docs, "question": question})
