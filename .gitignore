@@ -8,3 +8,5 @@ chroma_db/
 screenshots/
 .DS_Store
 log/
+log*/
+log_langgraph_*/
