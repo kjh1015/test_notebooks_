@@ -83,7 +83,7 @@ def chunk_markdown(md_text):
 
 def process_pdf_with_llm(documents):
     # Initialize ChatOpenAI
-    llm = ChatOpenAI(temperature=0.7)
+    llm = ChatOpenAI(temperature=0.0)
     
     # Process each chunk and combine results
     summaries = []
